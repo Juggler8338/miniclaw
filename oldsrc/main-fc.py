@@ -4,51 +4,29 @@ import lark_oapi as lark
 from lark_oapi.api.im.v1 import *
 from concurrent.futures import ThreadPoolExecutor
 
+# 引入本项目的其他模块
 from config import APP_ID, APP_SECRET
-from agent import ask_agent, clear_history
-from memory import archive_exchange
+from agent import ask_agent
 
-executor = ThreadPoolExecutor(max_workers=2) # 涉及文件 IO 读写，多用户场景可以开大一点并发
+# 初始化线程池与飞书标准客户端
+executor = ThreadPoolExecutor(max_workers=2)
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 
 def _async_ask_and_reply(data: P2ImMessageReceiveV1, user_message: str):
     """在子线程中运行的大模型推理与回复函数"""
-    chat_id = data.event.message.chat_id
-    cleaned_message = user_message.strip()
-    
     try:
         print(f"\n[🤖 Agent 开始思考]: {user_message}")
-        agent_response = ask_agent(chat_id, user_message)  
-        
-        # [新增]：在成功回复后，将本次对话归档到长期记忆中
-        archive_exchange(chat_id, user_message, agent_response)
-        
+        agent_response = ask_agent(user_message)  # 调用 agent.py 里的推理大脑
     except Exception as e:
         agent_response = f"大模型处理时发生错误: {str(e)}"
-    # 检查是否输入了清空会话的专属指令
-    if cleaned_message == "/clear":
-        print(f"\n[🧹 收到指令]: 正在清空用户 {chat_id} 的历史会话...")
-        try:
-            clear_history(chat_id)
-            agent_response = "✨ 记忆已成功清空！我们开始全新的对话吧。"
-        except Exception as e:
-            agent_response = f"清空记忆时发生异常: {str(e)}"
-    else:
-        # 正常对话分支
-        try:
-            print(f"\n[🤖 Agent 开始思考]: {user_message}")
-            # [修改点]：调用时传入当前的 chat_id，实现多轮记忆恢复与存储
-            agent_response = ask_agent(chat_id, user_message)  
-        except Exception as e:
-            agent_response = f"大模型处理时发生错误: {str(e)}"
-            print(agent_response)
+        print(agent_response)
 
-    # 组装飞书文本消息结构（保持不变）
+    # 组装飞书文本消息结构
     content = json.dumps({"text": agent_response})
 
     if data.event.message.chat_type == "p2p":
         request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(
-            CreateMessageRequestBody.builder().receive_id(chat_id).msg_type("text").content(content).build()
+            CreateMessageRequestBody.builder().receive_id(data.event.message.chat_id).msg_type("text").content(content).build()
         ).build()
         response = client.im.v1.message.create(request)
     else:

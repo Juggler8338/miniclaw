@@ -1,14 +1,16 @@
 # agent.py
 import re
+import json
+import os          # 新增：用于判断文件是否存在
+import threading   # 新增：用于多线程文件锁
 import torch
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
 
-# 引入配置与工具
 from config import MODEL_LOCAL_PATH
 from tools import AVAILABLE_TOOLS
 
 # ==========================================
-# 全局加载大模型 (导入该文件时自动加载一次)
+# 全局加载大模型 (保持不变)
 # ==========================================
 print(">>> 正在加载大模型，请稍候...")
 model = Qwen3VLForConditionalGeneration.from_pretrained(
@@ -17,39 +19,109 @@ model = Qwen3VLForConditionalGeneration.from_pretrained(
 processor = AutoProcessor.from_pretrained(MODEL_LOCAL_PATH, trust_remote_code=True)
 print(">>> 大模型加载完成！")
 
-def ask_agent(user_prompt: str) -> str:
-    """处理用户提问，执行多轮 ReAct 逻辑，返回最终答案"""
-    agent_system_prompt = """你是一个具备联网搜索能力的智能问答助手。
-[核心原则]
-1. 优先使用你的内在知识：对于百科常识、数学逻辑、编程代码、翻译或一般性建议，请直接思考并给出 Final Answer，不要使用工具。
-2. 仅在必要时搜索：只有当你无法确定答案，或者问题涉及“今天的实时新闻”、“当前的股票价格”、“最近发布的软件版本”等时效性极强的信息时，才使用 websearch。
-3. 搜索策略：如果决定搜索，请先在 Thought 中说明理由。
+# ==========================================
+# [核心新增]：持久化状态管理与文件锁
+# ==========================================
+STATE_FILE = "state.json"
+file_lock = threading.Lock()  # 全局文件锁，防止多线程同时读写 state.json 导致文件损坏
 
-[工具说明]
-- websearch: 仅用于检索互联网上的实时、最新信息。
+def load_history(chat_id: str, system_prompt: str) -> list:
+    """从 state.json 加载某个 chat_id 的历史对话，若不存在则初始化"""
+    with file_lock:
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if chat_id in data:
+                        return data[chat_id]
+            except Exception as e:
+                print(f"读取 {STATE_FILE} 失败，将重新初始化: {e}")
+        
+        # 没有任何历史，或者读取失败时，返回带 System Prompt 的初始结构
+        return [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
 
-[格式要求]
-Thought: 思考我接下来应该怎么做。是否需要使用工具？
-Action: 要使用的工具名称（只能是 websearch，或者为空）
-Action Input: 传给工具的简短关键词
+def save_history(chat_id: str, messages: list):
+    """将某个 chat_id 的历史对话保存到 state.json"""
+    with file_lock:
+        data = {}
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception as e:
+                print(f"读取 {STATE_FILE} 失败，将覆盖创建: {e}")
+        
+        data[chat_id] = messages
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"写入 {STATE_FILE} 失败: {e}")
 
-注意：当你输出完 'Action Input: [关键词]' 后，必须立刻停止生成，等待系统返回 Observation！
+def clear_history(chat_id: str):
+    """[需求3]：从 state.json 中彻底删除某个 chat_id 的历史记录"""
+    with file_lock:
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if chat_id in data:
+                    del data[chat_id]  # 删除该用户的记忆
+                    with open(STATE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=4)
+                print(f"🧹 已成功从持久化文件中清除 {chat_id} 的记忆")
+            except Exception as e:
+                print(f"清空 {chat_id} 记忆失败: {e}")
 
-如果你已经获得了足够的信息，或者不需要使用工具，请直接输出最终答案：
-Thought: 我已经知道答案了。
-Final Answer: [你的最终回答]
-"""
-    messages = [
-        {"role": "system", "content": [{"type": "text", "text": agent_system_prompt}]},
-        {"role": "user", "content": [{"type": "text", "text": user_prompt}]}
+
+# ==========================================
+# [核心修改]：ask_agent 增加 chat_id 参数
+# ==========================================
+def ask_agent(chat_id: str, user_prompt: str) -> str:
+    """处理用户提问，通过 chat_id 恢复和保存多轮对话历史"""
+    
+    # 修改 agent.py 中的 tools 列表和 system prompt
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "websearch",
+                "description": "仅用于检索互联网上的实时、最新信息。",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_memory",
+                "description": "用于搜索用户过去的长期对话记忆。当用户提及'以前'、'昨天'、'上次'或者你需要回顾你们的历史交流时使用。",
+                "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "用于搜索的关键词"}}, "required": ["query"]}
+            }
+        }
     ]
+
+    agent_system_prompt = """你是一个具备联网搜索和长期记忆提取能力的智能问答助手。
+    - 当涉及最新客观事实时，调用 websearch。
+    - 当用户询问你们过去的对话，或需要回忆历史上下文时，调用 search_memory。
+    优先使用你的内在知识，得到足够信息后，直接输出最终答案。"""
+    
+    # [修改点 2]：不再每次都硬编码初始化，而是通过 chat_id 从文件中读取或恢复历史
+    messages = load_history(chat_id, agent_system_prompt)
+    
+    # [修改点 2]：将当前用户输入追加到已恢复的历史记录中
+    messages.append({"role": "user", "content": [{"type": "text", "text": user_prompt}]})
 
     max_steps = 5  
     for step in range(max_steps):
         print(f"\n--- [Agent 第 {step + 1} 轮思考开始] ---", flush=True)
         
         inputs = processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_dict=True, return_tensors="pt"
+            messages, 
+            tools=tools, 
+            tokenize=True, 
+            add_generation_prompt=True, 
+            return_dict=True, 
+            return_tensors="pt"
         ).to(model.device)
 
         generated_ids = model.generate(**inputs, max_new_tokens=512)
@@ -59,42 +131,42 @@ Final Answer: [你的最终回答]
         output_text = processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
-        
-        # 截断自带的 Observation
-        if "Observation:" in output_text:
-            output_text = output_text.split("Observation:")[0].strip()
-        if "观察结果:" in output_text:
-            output_text = output_text.split("观察结果:")[0].strip()
 
         print(f"🤖 [模型本轮原始输出]:\n{output_text}", flush=True)
 
-        # 检查是否得到最终答案
-        if "Final Answer:" in output_text:
-            final_answer = output_text.split("Final Answer:")[-1].strip()
-            print(f"✅ [成功提取最终答案]: {final_answer}", flush=True)
-            return final_answer
+        tool_call_match = re.search(r"<tool_call>\n(.*?)\n</tool_call>", output_text, re.DOTALL)
 
-        action_match = re.search(r"Action:\s*(.*?)(?:\n|$)", output_text)
-        input_match = re.search(r"Action Input:\s*(.*?)(?:\n|$)", output_text)
-
-        if action_match and input_match:
-            action_name = action_match.group(1).strip()
-            action_input = input_match.group(1).strip()
-            print(f"🔧 [准备调用工具]: {action_name}, 参数: {action_input}", flush=True)
-
-            if action_name in AVAILABLE_TOOLS:
-                observation = AVAILABLE_TOOLS[action_name](action_input)
-                print(f"👀 [工具返回结果]:\n{observation}", flush=True)
+        if tool_call_match:
+            try:
+                tool_data = json.loads(tool_call_match.group(1))
+                action_name = tool_data.get("name")
+                action_input = tool_data.get("arguments", {}).get("query")
                 
+                print(f"🔧 [模型请求调用工具]: {action_name}, 参数: {action_input}", flush=True)
+
+                if action_name in AVAILABLE_TOOLS:
+                    observation = AVAILABLE_TOOLS[action_name](action_input)
+                    print(f"👀 [工具返回结果]:\n{observation}", flush=True)
+                    
+                    messages.append({"role": "assistant", "content": [{"type": "text", "text": output_text}]})
+                    messages.append({"role": "tool", "name": action_name, "content": [{"type": "text", "text": str(observation)}]})
+                else:
+                    print(f"⚠️ [找不到请求的工具: {action_name}]", flush=True)
+                    messages.append({"role": "assistant", "content": [{"type": "text", "text": output_text}]})
+                    messages.append({"role": "tool", "name": action_name, "content": [{"type": "text", "text": "Error: Tool not found."}]})
+                    
+            except json.JSONDecodeError:
+                print("⚠️ [模型输出的 JSON 格式有误，提示纠正]", flush=True)
                 messages.append({"role": "assistant", "content": [{"type": "text", "text": output_text}]})
-                messages.append({"role": "user", "content": [{"type": "text", "text": f"Observation: {observation}"}]})
-            else:
-                messages.append({"role": "assistant", "content": [{"type": "text", "text": output_text}]})
-                messages.append({"role": "user", "content": [{"type": "text", "text": f"Observation: 找不到工具 {action_name}。"}]})
+                messages.append({"role": "user", "content": [{"type": "text", "text": "你的工具调用格式有误，请确保输出标准的 JSON 结构。"}]})
         else:
-            print("⚠️ [模型输出格式错误，提示纠正]", flush=True)
+            print(f"✅ [成功提取最终答案]: {output_text}", flush=True)
+            
+            # [修改点 1]：在成功返回最终答案之前，必须将助理的回答也追加入历史，并写回 state.json
             messages.append({"role": "assistant", "content": [{"type": "text", "text": output_text}]})
-            messages.append({"role": "user", "content": [{"type": "text", "text": "Observation: 输出格式不正确。请严格按照要求提供 Thought, Action (如果有) 以及 Final Answer。"}]})
+            save_history(chat_id, messages)
+            
+            return output_text.strip()
 
     print("❌ [达到最大步数 5，强制退出]", flush=True)
     return "抱歉，我思考了太久，暂时无法给出答案。请重试或换个问法。"
