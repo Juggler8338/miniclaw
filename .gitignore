@@ -12,3 +12,8 @@ __pycache__
 .venv
 
 target
+
+res
+*/history
+*/memory_archives
+*/temp_images

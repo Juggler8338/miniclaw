@@ -1,11 +1,10 @@
 # agent.py
+from pyexpat.errors import messages
 import re
 import json
-import os          # 新增：用于判断文件是否存在
-import threading   # 新增：用于多线程文件锁
-import torch
+import os
 from transformers import Qwen3VLForConditionalGeneration, AutoProcessor
-
+from qwen_vl_utils import process_vision_info
 from config import MODEL_LOCAL_PATH
 from tools import AVAILABLE_TOOLS
 
@@ -20,64 +19,66 @@ processor = AutoProcessor.from_pretrained(MODEL_LOCAL_PATH, trust_remote_code=Tr
 print(">>> 大模型加载完成！")
 
 # ==========================================
-# [核心新增]：持久化状态管理与文件锁
+# [修复 3 & 4]：分布式持久化与上下文截断
 # ==========================================
-STATE_FILE = "state.json"
-file_lock = threading.Lock()  # 全局文件锁，防止多线程同时读写 state.json 导致文件损坏
+HISTORY_DIR = "history"
+
+# 确保历史记录文件夹存在
+if not os.path.exists(HISTORY_DIR):
+    os.makedirs(HISTORY_DIR)
+
+def _get_user_file(chat_id: str) -> str:
+    """获取指定用户的历史记录文件路径"""
+    # 替换特殊字符以防路径注入（简单防护）
+    safe_chat_id = "".join(c for c in chat_id if c.isalnum() or c in ('-', '_'))
+    return os.path.join(HISTORY_DIR, f"{safe_chat_id}.json")
 
 def load_history(chat_id: str, system_prompt: str) -> list:
-    """从 state.json 加载某个 chat_id 的历史对话，若不存在则初始化"""
-    with file_lock:
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if chat_id in data:
-                        return data[chat_id]
-            except Exception as e:
-                print(f"读取 {STATE_FILE} 失败，将重新初始化: {e}")
-        
-        # 没有任何历史，或者读取失败时，返回带 System Prompt 的初始结构
-        return [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
+    """从单独的用户文件中加载历史，若不存在则初始化"""
+    user_file = _get_user_file(chat_id)
+    
+    if os.path.exists(user_file):
+        try:
+            with open(user_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ 读取 {user_file} 失败，将重新初始化: {e}")
+    
+    # 没有任何历史，或者读取失败时，返回带 System Prompt 的初始结构
+    return [{"role": "system", "content": [{"type": "text", "text": system_prompt}]}]
 
 def save_history(chat_id: str, messages: list):
-    """将某个 chat_id 的历史对话保存到 state.json"""
-    with file_lock:
-        data = {}
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-            except Exception as e:
-                print(f"读取 {STATE_FILE} 失败，将覆盖创建: {e}")
+    """保存历史，并限制最大上下文轮数防止 OOM"""
+    # [修复 3]：最大保留最近的 10 条消息（5轮对话）
+    # 注意：千万不能截掉 index 0 的 system_prompt
+    MAX_HISTORY_MESSAGES = 10 
+    
+    if len(messages) > MAX_HISTORY_MESSAGES + 1:
+        # 保留 [0] (System Prompt) 以及最后的 MAX_HISTORY_MESSAGES 条对话
+        messages = [messages[0]] + messages[-MAX_HISTORY_MESSAGES:]
         
-        data[chat_id] = messages
-        try:
-            with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            print(f"写入 {STATE_FILE} 失败: {e}")
+    user_file = _get_user_file(chat_id)
+    try:
+        # 直接覆盖写入该用户的专属文件，无需全局锁
+        with open(user_file, "w", encoding="utf-8") as f:
+            json.dump(messages, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"❌ 写入 {user_file} 失败: {e}")
 
 def clear_history(chat_id: str):
-    """[需求3]：从 state.json 中彻底删除某个 chat_id 的历史记录"""
-    with file_lock:
-        if os.path.exists(STATE_FILE):
-            try:
-                with open(STATE_FILE, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if chat_id in data:
-                    del data[chat_id]  # 删除该用户的记忆
-                    with open(STATE_FILE, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=4)
-                print(f"🧹 已成功从持久化文件中清除 {chat_id} 的记忆")
-            except Exception as e:
-                print(f"清空 {chat_id} 记忆失败: {e}")
-
+    """彻底删除某个 chat_id 的历史记录文件"""
+    user_file = _get_user_file(chat_id)
+    if os.path.exists(user_file):
+        try:
+            os.remove(user_file)
+            print(f"🧹 已成功删除文件，清空 {chat_id} 的记忆")
+        except Exception as e:
+            print(f"❌ 清空 {chat_id} 记忆失败: {e}")
 
 # ==========================================
 # [核心修改]：ask_agent 增加 chat_id 参数
 # ==========================================
-def ask_agent(chat_id: str, user_prompt: str) -> str:
+def ask_agent(chat_id: str, user_prompt: str, is_temp: bool = False, image_path: str = None) -> str:
     """处理用户提问，通过 chat_id 恢复和保存多轮对话历史"""
     
     # 修改 agent.py 中的 tools 列表和 system prompt
@@ -100,31 +101,64 @@ def ask_agent(chat_id: str, user_prompt: str) -> str:
         }
     ]
 
-    agent_system_prompt = """你是一个具备联网搜索和长期记忆提取能力的智能问答助手。
-    - 当涉及最新客观事实时，调用 websearch。
-    - 当用户询问你们过去的对话，或需要回忆历史上下文时，调用 search_memory。
-    优先使用你的内在知识，得到足够信息后，直接输出最终答案。"""
+    # 稍微优化系统提示词，让它知道自己具备视觉能力
+    agent_system_prompt = """你是一个具备强大视觉理解(OCR/全能识别)、联网搜索和长期记忆能力的智能助手。
+    - 当用户发送图片时，请仔细分析图片内容（识别物体、提取文档文字、分析图表等），并给出专业的解答。
+    - 当用户的提问需要检索最新信息时，调用 `websearch`。
+    - 当用户询问历史记忆时，调用 `search_memory`。"""
     
-    # [修改点 2]：不再每次都硬编码初始化，而是通过 chat_id 从文件中读取或恢复历史
-    messages = load_history(chat_id, agent_system_prompt)
+    if is_temp:
+        messages = [{"role": "system", "content": [{"type": "text", "text": agent_system_prompt}]}]
+    else:
+        messages = load_history(chat_id, agent_system_prompt)
     
-    # [修改点 2]：将当前用户输入追加到已恢复的历史记录中
-    messages.append({"role": "user", "content": [{"type": "text", "text": user_prompt}]})
+    # ==========================================
+    # [核心修改]：支持图文混合的 Message 构建
+    # ==========================================
+    user_content = []
+    
+    # 1. 如果包含图片，将图片对象加入列表
+    if image_path and os.path.exists(image_path):
+        # Qwen3-VL 支持直接传入本地绝对路径或 file:// URI
+        # 此处使用本地路径或 file:// 均可，推荐 url 格式以防 Windows/Linux 路径差异
+        user_content.append({"type": "image", "image": f"file://{os.path.abspath(image_path)}"})
+        
+    # 2. 将文本提示词加入列表
+    if user_prompt:
+        user_content.append({"type": "text", "text": user_prompt})
+        
+    # 3. 如果既没图片也没文本(防呆兜底)
+    if not user_content:
+        user_content.append({"type": "text", "text": "你好"})
+
+    # 追加本轮输入
+    messages.append({"role": "user", "content": user_content})
 
     max_steps = 5  
     for step in range(max_steps):
         print(f"\n--- [Agent 第 {step + 1} 轮思考开始] ---", flush=True)
         
-        inputs = processor.apply_chat_template(
+        # 1. 使用 template 生成包含工具和图片的纯文本 Prompt 字符串 (注意 tokenize=False)
+        text = processor.apply_chat_template(
             messages, 
             tools=tools, 
-            tokenize=True, 
-            add_generation_prompt=True, 
-            return_dict=True, 
+            tokenize=False, 
+            add_generation_prompt=True
+        )
+        
+        # 2. 从 messages 中提取并读取图片文件
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        # 3. 将文本、图片一同传入 processor，在这里才会真正转化出包含 pixel_values 的完整 inputs
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
             return_tensors="pt"
         ).to(model.device)
 
-        generated_ids = model.generate(**inputs, max_new_tokens=512)
+        generated_ids = model.generate(**inputs, max_new_tokens=1024)
         generated_ids_trimmed = [
             out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -134,7 +168,8 @@ def ask_agent(chat_id: str, user_prompt: str) -> str:
 
         print(f"🤖 [模型本轮原始输出]:\n{output_text}", flush=True)
 
-        tool_call_match = re.search(r"<tool_call>\n(.*?)\n</tool_call>", output_text, re.DOTALL)
+        # [修复 5]：使用 \s* 匹配可能存在的空格或换行，增加容错率
+        tool_call_match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", output_text, re.DOTALL)
 
         if tool_call_match:
             try:
@@ -162,9 +197,14 @@ def ask_agent(chat_id: str, user_prompt: str) -> str:
         else:
             print(f"✅ [成功提取最终答案]: {output_text}", flush=True)
             
-            # [修改点 1]：在成功返回最终答案之前，必须将助理的回答也追加入历史，并写回 state.json
+            # 在返回结果前，先把助手的回答存入 messages
             messages.append({"role": "assistant", "content": [{"type": "text", "text": output_text}]})
-            save_history(chat_id, messages)
+            
+            # [修改点 3]：仅在非临时会话时，才将历史写入磁盘
+            if not is_temp:
+                save_history(chat_id, messages)
+            else:
+                print(f"👻 [无痕模式]：本次对话结束，不保存至本地文件。")
             
             return output_text.strip()
 

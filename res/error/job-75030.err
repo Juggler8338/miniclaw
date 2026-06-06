@@ -1,3 +1,0 @@
-/home/ca0003un/.conda/envs/qwen3/lib/python3.11/site-packages/lark_oapi/ws/pb/google/__init__.py:2: UserWarning: pkg_resources is deprecated as an API. See https://setuptools.pypa.io/en/latest/pkg_resources.html. The pkg_resources package is slated for removal as early as 2025-11-30. Refrain from using this package or pin to Setuptools<81.
-  __import__('pkg_resources').declare_namespace(__name__)
-slurmstepd-gpu-6000ada-1: error: *** JOB 75030 ON gpu-6000ada-1 CANCELLED AT 2026-06-03T17:45:15 ***
