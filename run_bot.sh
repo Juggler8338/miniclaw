@@ -38,4 +38,4 @@ echo "Starting Feishu Agent Bot..."
 cd echo_bot
 
 # 启动修改后的主程序 
-python3 -u main.py
+python3 -u bot.py

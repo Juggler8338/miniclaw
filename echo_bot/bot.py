@@ -7,9 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from config import APP_ID, APP_SECRET
 from agent import ask_agent, clear_history
-from memory import archive_exchange
 
-executor = ThreadPoolExecutor(max_workers=2) # 涉及文件 IO 读写，多用户场景可以开大一点并发
+executor = ThreadPoolExecutor(max_workers=1)
 client = lark.Client.builder().app_id(APP_ID).app_secret(APP_SECRET).build()
 
 # 确保图片临时存储目录存在
@@ -70,11 +69,12 @@ def _async_ask_and_reply(data: P2ImMessageReceiveV1, user_message: str, image_pa
             print(f"\n[🤖 Agent 开始思考]: 文本='{cleaned_message}', 图片={image_path}")
             agent_response = ask_agent(chat_id, cleaned_message, is_temp=False, image_path=image_path)  
             
-            # 只有常规会话才归档长期记忆
-            if cleaned_message:
-                archive_exchange(chat_id, cleaned_message, agent_response)
         except Exception as e:
             agent_response = f"大模型处理时发生错误: {str(e)}"
+        finally:
+            # 无论成功还是异常，都确保图片被清理
+            if image_path and os.path.exists(image_path):
+                os.remove(image_path)
 
     # === 发送回复 ===
     content = json.dumps({"text": agent_response})
@@ -88,10 +88,6 @@ def _async_ask_and_reply(data: P2ImMessageReceiveV1, user_message: str, image_pa
             ReplyMessageRequestBody.builder().content(content).msg_type("text").build()
         ).build()
         response = client.im.v1.message.reply(request)
-        
-    # 可选：推理完成后删除本地临时图片节省空间
-    if image_path and os.path.exists(image_path):
-        os.remove(image_path)
 
 def do_p2_im_message_receive_v1(data: P2ImMessageReceiveV1) -> None:
     """主线程收到飞书事件后，迅速分发到线程池"""
