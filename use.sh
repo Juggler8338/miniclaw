@@ -13,7 +13,7 @@ if [ -f /etc/profile ]; then
 fi
 
 module load Miniforge3
-source activate qwen3
+source activate miniclaw
 
 echo "Current Python: $(which python)"
 echo "Python Version: $(python --version)"
